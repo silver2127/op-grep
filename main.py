@@ -1,3 +1,4 @@
+from argparse import ArgumentParser
 from dataclasses import dataclass
 
 import torch
@@ -37,7 +38,16 @@ def predict_action(model: GrepModel, query: str) -> ActionPrediction:
 
 
 def main():
-    model = load_model()
+    parser = ArgumentParser(description="Run op-grep inference")
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Compute device for inference. 'auto' selects CUDA when available.",
+    )
+    args = parser.parse_args()
+
+    model = load_model(device=args.device)
 
     tests = [
         "Why does the retry loop skip logging when the proxy returns 429?",

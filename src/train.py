@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import random
+from argparse import ArgumentParser
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -15,7 +16,20 @@ SUPERVISED_DATA = PROJECT_ROOT / "datasets" / "example_supervised.jsonl"
 MODEL_PATH = PROJECT_ROOT / "model.pth"
 
 
-def load_supervised_records(path: Path) -> List[Dict]:
+def _resolve_device(device: str | torch.device) -> torch.device:
+    if isinstance(device, torch.device):
+        return device
+    device = device.lower()
+    if device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested but no compatible GPU is available.")
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def load_supervised_records(path: Path, limit: Optional[int] = None) -> List[Dict]:
     if not path.exists():
         raise FileNotFoundError(f"Expected supervised dataset at {path}")
     records: List[Dict] = []
@@ -26,6 +40,9 @@ def load_supervised_records(path: Path) -> List[Dict]:
                 records.append(json.loads(line))
     if not records:
         raise ValueError("Supervised dataset is empty; cannot train model.")
+    if limit is not None and limit > 0 and len(records) > limit:
+        random.Random(0).shuffle(records)
+        records = records[:limit]
     return records
 
 
@@ -64,8 +81,15 @@ def build_tool_map(records: List[Dict]) -> Dict[str, int]:
     return tool_to_idx
 
 
-def main(num_epochs: int = 6) -> None:
-    records = load_supervised_records(SUPERVISED_DATA)
+def main(
+    num_epochs: int = 6,
+    device: str | torch.device = "auto",
+    data_path: Optional[Path] = None,
+    max_records: Optional[int] = None,
+) -> None:
+    target_device = _resolve_device(device)
+    dataset_path = data_path or SUPERVISED_DATA
+    records = load_supervised_records(dataset_path, limit=max_records)
     vocab = build_vocab(records)
     label_to_idx = build_label_map(records)
     tool_to_idx = build_tool_map(records)
@@ -89,6 +113,7 @@ def main(num_epochs: int = 6) -> None:
             )
 
     model = GrepModel(vocab=vocab, label_to_idx=label_to_idx, tool_to_idx=tool_to_idx)
+    model.to(target_device)
     optimiser = torch.optim.Adam(model.parameters(), lr=3e-3)
     loss_fn_path = nn.NLLLoss()
     loss_fn_tool = nn.NLLLoss()
@@ -134,4 +159,35 @@ def main(num_epochs: int = 6) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = ArgumentParser(description="Train the op-grep action selector model")
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=6,
+        help="Number of training epochs (default: 6)",
+    )
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Compute device to use. 'auto' selects CUDA when available.",
+    )
+    parser.add_argument(
+        "--data",
+        type=Path,
+        default=SUPERVISED_DATA,
+        help="Path to the supervised JSONL dataset (default: datasets/example_supervised.jsonl)",
+    )
+    parser.add_argument(
+        "--max-records",
+        type=int,
+        default=None,
+        help="Limit the number of supervision records loaded from the dataset",
+    )
+    args = parser.parse_args()
+    main(
+        num_epochs=args.epochs,
+        device=args.device,
+        data_path=args.data,
+        max_records=args.max_records,
+    )
