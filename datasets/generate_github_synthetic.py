@@ -17,8 +17,8 @@ Basic usage
     --allowed-license MIT --allowed-license Apache-2.0 \
         [--github-token $GITHUB_TOKEN]
 
-Provide a GitHub personal access token via --github-token or the
-GITHUB_TOKEN environment variable to avoid strict rate limits.
+Provide a GitHub personal access token via --github-token or by placing
+`github_token.txt` under `../secrets/` to avoid strict rate limits.
 """
 
 from __future__ import annotations
@@ -26,11 +26,14 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import os
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+SECRET_TOKEN_FILE = "github_token.txt"
+
 from urllib import error, parse, request
 
 
@@ -113,6 +116,21 @@ class CodeRecord:
         )
 
 
+def locate_token_file() -> Optional[Path]:
+    candidate = WORKSPACE_ROOT / "secrets" / SECRET_TOKEN_FILE
+    return candidate if candidate.exists() else None
+
+
+def resolve_token(cli_value: Optional[str]) -> Optional[str]:
+    if cli_value:
+        stripped = cli_value.strip()
+        return stripped or None
+    secret_path = locate_token_file()
+    if secret_path:
+        return secret_path.read_text(encoding="utf-8").strip() or None
+    return None
+
+
 class GitHubClient:
     def __init__(self, token: Optional[str], max_retries: int = 3, backoff: float = 2.0) -> None:
         self._token = token
@@ -125,7 +143,11 @@ class GitHubClient:
         req.add_header("Accept", "application/vnd.github+json")
         req.add_header("User-Agent", USER_AGENT)
         if self._token:
-            req.add_header("Authorization", f"Bearer {self._token}")
+            token = self._token.strip()
+            scheme = "Bearer"
+            if token.startswith(("ghp_", "gho_", "ghu_", "ghs_", "ghr_")):
+                scheme = "token"
+            req.add_header("Authorization", f"{scheme} {token}")
         return req
 
     def _rate_limit_wait(self, headers: Dict[str, str]) -> None:
@@ -135,6 +157,10 @@ class GitHubClient:
             reset_at = int(reset)
             sleep_for = max(0, reset_at - int(time.time()) + 1)
             if sleep_for > 0:
+                print(
+                    "GitHub: hit search rate limit, sleeping "
+                    f"{sleep_for}s (remaining={remaining})"
+                )
                 time.sleep(sleep_for)
 
     def get_json(self, endpoint: str, params: Optional[Dict[str, str]] = None) -> Tuple[Dict, Dict[str, str]]:
@@ -157,6 +183,13 @@ class GitHubClient:
                 if exc.code == 403 and "X-RateLimit-Reset" in headers:
                     self._rate_limit_wait(headers)
                     continue
+                if exc.code == 401:
+                    detail = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+                    raise RuntimeError(
+                        "GitHub returned 401 Unauthorized. Verify that your token is valid, "
+                        "hasn't expired, and includes the required scopes (repo at minimum). "
+                        f"API response: {detail.strip()}"
+                    ) from exc
                 attempt += 1
                 if attempt > self._max_retries:
                     raise RuntimeError(f"GitHub request failed ({exc.code}): {exc.reason}") from exc
@@ -184,6 +217,38 @@ class GitHubClient:
         return spdx
 
 
+def log_rate_limit(headers: Dict[str, str], label: str) -> None:
+    def grab(name: str) -> Optional[str]:
+        return headers.get(name) or headers.get(name.lower())
+
+    limit = grab("X-RateLimit-Limit")
+    remaining = grab("X-RateLimit-Remaining")
+    used = grab("X-RateLimit-Used")
+    reset_raw = grab("X-RateLimit-Reset")
+    resource = grab("X-RateLimit-Resource")
+
+    if not any([limit, remaining, used, reset_raw, resource]):
+        print(f"GitHub: no rate-limit headers available for {label}")
+        return
+
+    reset_human = None
+    if reset_raw and reset_raw.isdigit():
+        reset_dt = datetime.fromtimestamp(int(reset_raw), tz=timezone.utc)
+        reset_human = reset_dt.isoformat()
+
+    reset_segment = (
+        f"reset {reset_raw}"
+        if not reset_human
+        else f"reset {reset_raw} ({reset_human})"
+    )
+
+    print(
+        "GitHub rate status "
+        f"({label}): limit={limit} remaining={remaining} used={used} "
+        f"resource={resource} {reset_segment}"
+    )
+
+
 def resolve_language(raw: str) -> str:
     normalized = raw.lower()
     mapped = LANGUAGE_ALIASES.get(normalized)
@@ -205,8 +270,8 @@ def trim_code(content: str) -> str:
 
 
 def build_query(keyword: str, language: str) -> str:
-    safe_keyword = keyword.strip().replace(" ", "+")
-    return f"{safe_keyword}+language:{language}"
+    safe_keyword = " ".join(keyword.strip().split())
+    return f"{safe_keyword} language:{language}"
 
 
 def search_language_examples(
@@ -217,6 +282,7 @@ def search_language_examples(
     sleep_ms: int,
     allowed_licenses: Optional[Set[str]],
     allow_unlicensed: bool,
+    on_record: Optional[Callable[[CodeRecord], None]] = None,
 ) -> List[CodeRecord]:
     collected: List[CodeRecord] = []
     seen: set[Tuple[str, str]] = set()
@@ -230,6 +296,7 @@ def search_language_examples(
     if not queries:
         queries = ["class"]
 
+    print(f"Starting {lang_label} harvest (target {target} examples across {len(queries)} keywords)")
     for keyword in queries:
         if len(collected) >= target:
             break
@@ -241,9 +308,26 @@ def search_language_examples(
                 "per_page": "30",
                 "page": str(page),
             }
+            if page == 1:
+                print(
+                    f"{lang_label}: querying '{params['q']}' (page {page}, collected {len(collected)})"
+                )
+            else:
+                print(
+                    f"{lang_label}: continuing keyword '{keyword}' page {page} (collected {len(collected)})"
+                )
             data, _ = client.get_json(search_url, params=params)
             items = data.get("items", [])
             if not items:
+                note = data.get("message") or data.get("documentation_url")
+                if note:
+                    print(
+                        f"{lang_label}: no results for keyword '{keyword}' page {page} (note: {note})"
+                    )
+                elif len(collected) == 0 and page == 1:
+                    print(
+                        f"{lang_label}: empty search response for '{keyword}' page {page}: {data}"
+                    )
                 break
             for item in items:
                 repo_info = item.get("repository", {})
@@ -262,13 +346,30 @@ def search_language_examples(
                     api_url=repo_info.get("url"),
                 )
                 if license_id is None and not allow_unlicensed:
+                    # Debugging: log first handful of skips per language
+                    if len(collected) == 0:
+                        print(
+                            f"{lang_label}: skipping {repo}/{path} due to missing license"
+                        )
                     continue
                 if allowed_licenses and license_id and license_id not in allowed_licenses:
+                    if len(collected) == 0:
+                        print(
+                            f"{lang_label}: skipping {repo}/{path} due to license {license_id}"
+                        )
                     continue
                 metadata, _ = client.get_json(item["url"])
                 if metadata.get("size", 0) > MAX_FILE_BYTES:
+                    if len(collected) == 0:
+                        print(
+                            f"{lang_label}: skipping {repo}/{path} due to size {metadata.get('size')}"
+                        )
                     continue
                 if metadata.get("encoding") != "base64" or "content" not in metadata:
+                    if len(collected) == 0:
+                        print(
+                            f"{lang_label}: skipping {repo}/{path} due to unexpected encoding"
+                        )
                     continue
                 content_bytes = base64.b64decode(metadata["content"].replace("\n", ""))
                 try:
@@ -291,14 +392,44 @@ def search_language_examples(
                     code=snippet,
                 )
                 collected.append(record)
+                if on_record:
+                    on_record(record)
+                if len(collected) % 100 == 0 or len(collected) == target:
+                    print(
+                        f"{lang_label}: collected {len(collected)} / {target} examples (keyword '{keyword}', page {page})"
+                    )
+                elif len(collected) % 25 == 0:
+                    print(
+                        f"{lang_label}: {len(collected)} collected (keyword '{keyword}', page {page})"
+                    )
+                    snippet_preview = record.code.splitlines()
+                    preview_line = snippet_preview[0] if snippet_preview else ""
+                    if len(preview_line) > 120:
+                        preview_line = preview_line[:117] + "..."
+                    print(
+                        "  "
+                        + f"#{len(collected):04d} {repo}/{path} size={record.size} license={record.license or 'UNKNOWN'}"
+                    )
+                    if preview_line:
+                        print("    " + preview_line)
                 if len(collected) >= target:
                     break
             if len(collected) >= target:
                 break
             if len(items) < int(params["per_page"]):
+                print(
+                    f"{lang_label}: exhausted results for keyword '{keyword}' at page {page}"
+                )
                 break
             page += 1
             time.sleep(sleep_ms / 1000)
+            if page % 10 == 0:
+                print(
+                    f"{lang_label}: advanced to page {page} for keyword '{keyword}' (current {len(collected)} samples)"
+                )
+        print(
+            f"{lang_label}: finished keyword '{keyword}' at {len(collected)} collected"
+        )
     return collected
 
 
@@ -333,7 +464,7 @@ def parse_args() -> argparse.Namespace:
         "--github-token",
         type=str,
         default=None,
-        help="GitHub token for higher rate limits (falls back to GITHUB_TOKEN env)",
+        help="GitHub token for higher rate limits (falls back to secrets/github_token.txt)",
     )
     parser.add_argument(
         "--keyword",
@@ -364,8 +495,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    token = args.github_token or os.environ.get("GITHUB_TOKEN")
+    token = resolve_token(args.github_token)
+    if not token:
+        raise SystemExit(
+            "No GitHub token available. Provide --github-token or add secrets/github_token.txt"
+        )
     client = GitHubClient(token=token)
+    _, initial_headers = client.get_json("https://api.github.com/rate_limit")
+    log_rate_limit(initial_headers, label="startup")
     if args.allowed_licenses is None:
         allowed = {lic.upper() for lic in DEFAULT_PERMISSIVE_LICENSES}
     else:
@@ -373,24 +510,30 @@ def main() -> None:
     allow_unlicensed = bool(args.allow_unlicensed)
     records: List[CodeRecord] = []
 
-    for language in args.languages:
-        lang_records = search_language_examples(
-            client=client,
-            language=language,
-            target=args.examples_per_language,
-            keywords=args.keyword,
-            sleep_ms=args.sleep_ms,
-            allowed_licenses=allowed,
-            allow_unlicensed=allow_unlicensed,
-        )
-        records.extend(lang_records)
-        print(f"Collected {len(lang_records)} {language} examples")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with args.output.open("w", encoding="utf-8") as sink:
+        def persist(record: CodeRecord) -> None:
+            sink.write(record.to_json() + "\n")
+            sink.flush()
+
+        for language in args.languages:
+            lang_records = search_language_examples(
+                client=client,
+                language=language,
+                target=args.examples_per_language,
+                keywords=args.keyword,
+                sleep_ms=args.sleep_ms,
+                allowed_licenses=allowed,
+                allow_unlicensed=allow_unlicensed,
+                on_record=persist,
+            )
+            records.extend(lang_records)
+            print(f"Collected {len(lang_records)} {language} examples")
 
     if not records:
         raise SystemExit("No GitHub examples collected. Adjust languages or provide a token.")
 
-    write_jsonl(records, args.output)
-    print(f"Wrote {len(records)} records to {args.output}")
+    print(f"Wrote {len(records)} records to {args.output} (data streamed during harvest)")
 
 
 if __name__ == "__main__":

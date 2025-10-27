@@ -15,8 +15,8 @@ Example usage
         --api-base https://api.x.ai/v1 \
         --temperature 0.2
 
-Provide the xAI token using --api-key or the XAI_API_KEY environment
-variable. Records that already contain `reference_answer` are skipped by
+Provide the xAI token using --api-key, the XAI_API_KEY environment
+variable, or by placing `xai_api_key.txt` under `../secrets/`. Records that already contain `reference_answer` are skipped by
 default; pass --overwrite to regenerate.
 """
 
@@ -37,6 +37,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "Use the supplied context to ground your response and explain the key "
     "file or function when relevant."
 )
+
+SECRET_FILE_NAME = "xai_api_key.txt"
 
 
 def read_jsonl(path: Path) -> List[Dict]:
@@ -73,6 +75,24 @@ def build_context(record: Dict) -> str:
         targets = ", ".join(t.get("path", "unknown") for t in record["ground_truth"])
         parts.append(f"Relevant files: {targets}")
     return "\n\n".join(parts)
+
+
+def locate_secret_file() -> Optional[Path]:
+    workspace_root = Path(__file__).resolve().parents[3]
+    candidate = workspace_root / "secrets" / SECRET_FILE_NAME
+    return candidate if candidate.exists() else None
+
+
+def resolve_api_key(cli_value: Optional[str]) -> Optional[str]:
+    if cli_value:
+        return cli_value.strip()
+    env_value = os.environ.get("XAI_API_KEY")
+    if env_value:
+        return env_value.strip()
+    secret_path = locate_secret_file()
+    if secret_path:
+        return secret_path.read_text(encoding="utf-8").strip()
+    return None
 
 
 def make_payload(
@@ -194,7 +214,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    api_key = args.api_key or os.environ.get("XAI_API_KEY")
+    api_key = resolve_api_key(args.api_key)
     if not api_key:
         raise SystemExit("Provide an xAI API key via --api-key or XAI_API_KEY env var")
 
